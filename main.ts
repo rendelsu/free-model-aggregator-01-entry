@@ -118,6 +118,40 @@ const MAX_ATTEMPTS = 12;
  * BUDGET_MIN is each provider's smallest possible budget; the router never
  * plans a call past it while any provider under it can serve (a call past
  * it risks a 402 budget refusal on top of the schedule).
+ *
+ * Round 3 (Monte Carlo over the same generator draw, 5000 trials x 2 seeds):
+ * round 2 scored 22 calls on the server (rank 115/1571) while the top-80 bar
+ * is also 22 calls, lost on submit-time tie-break — so round 3 buys cheaper
+ * calls and guards the score. Three changes, all verified in the faithful
+ * simulator (fma-r2/sim2.py) before landing here:
+ * - Weight-1 slack widened to 90 (from 40): the cheapest extra slots belong
+ *   to kilol (1420) and pollinations (1390), 55-85 below the best rating;
+ *   spending that slack on weight-1 requests (loss 55-85 each, never on
+ *   weight-2) cuts the mean from 23.4 to 22.9 calls.
+ * - Capability reservation (capacity rule): for each future request with
+ *   provider set S, if the fresh providers in S are no more than the future
+ *   requests that can only be served from S, the current request may not
+ *   spend a fresh provider in S when it has a candidate outside S. This
+ *   keeps a guaranteed first call for the narrow vision (r06) and
+ *   min-context (r10-r12) requests, which round 2 could leave unserved
+ *   when the earlier requests had spent every narrow provider's first call
+ *   (e.g. MC trial 303: gemini out from call 2, zai/sambanova/cloudflare
+ *   failing call 2 — r06 unserved, quality 91). It lifts P(score 99) from
+ *   0.989 to 0.999; the widened slack alone would have let the loss tail
+ *   grow, so a loss cap (below) holds it.
+ * - Lookahead ranking for started providers: a provider already used is
+ *   ranked by the AVERAGE PFAIL of its next TWO calls, not just the next
+ *   one — paying a provider's #2 slot unlocks its cheap #3+ slots, so the
+ *   pair (kilol #2 + #3) is cheaper than two later slots elsewhere. Fresh
+ *   providers still rank by their free first call. A cumulative-loss cap
+ *   of 500 tightens the weight-1 slack back to 40 once the rating loss
+ *   spent reaches it, keeping quality 98+ in 99.9% of draws; the cap value
+ *   is also the one that keeps practice trial-0 at 21 calls (600 lets it
+ *   slip to 22, the round-2 count).
+ * Net (MC 5000 x 2 seeds): mean 22.9 calls (round 2: 23.4), P(<=21 calls)
+ * 0.25 (round 2: 0.13), P(score 99) 0.999 (round 2: 0.989). The 21.5-call
+ * mean target is out of reach on this frontier: the loss budget (764) binds
+ * before the call count can fall further.
  */
 const BUDGET_MIN: Record<string, number> = {
   groq: 9,
@@ -153,11 +187,20 @@ const PFAIL: Record<string, number[]> = {
  * may drop further still, but never below the fresh-provider floor: a retry
  * to a fresh provider always succeeds, so a fresh provider within 25 of the
  * best is always preferred over gambling another call.
+ *
+ * Round 3: DELTA_WEIGHT_1 is 90 (kilol 1420 and pollinations 1390 are 55-85
+ * below the best rating, and their #3+ slots are the cheapest extra calls).
+ * Once the cumulative rating loss (LOSS_CAP) is spent, the weight-1 slack
+ * tightens back to the round-2 value so the loss tail cannot push quality
+ * below 98.
  */
 const DELTA_WEIGHT_2 = 17;
-const DELTA_WEIGHT_1 = 40;
+const DELTA_WEIGHT_1 = 90;
+const DELTA_WEIGHT_1_CAPPED = 40;
 const DELTA_RETRY_FRESH = 25;
 const DELTA_RETRY = 40;
+/** Cumulative weighted rating loss (vs the best rating) that tightens the slack. */
+const LOSS_CAP = 500;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -171,6 +214,8 @@ let manifestIndex = 0;
 const callsMade = new Map<string, number>();
 /** Consecutive failed upstream calls, per provider. */
 const consecutiveFailures = new Map<string, number>();
+/** Cumulative weighted rating loss vs the best rating, over served requests (round 3 loss cap). */
+let lossSoFar = 0;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -231,15 +276,67 @@ function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic',
 }
 
 /**
- * The next candidate to try, round 2 (risk-aware).
+ * Round 3: the ranking cost of a provider's next call. A fresh provider's
+ * next call is its free first call (PFAIL 0). A provider already used is
+ * ranked by the AVERAGE PFAIL of its next TWO calls: paying its #2 slot
+ * unlocks its cheap #3+ slots, so the pair is what the router is really
+ * buying. A missing table entry (past the drawn budget) counts as 1.0.
+ */
+function rankKey(providerId: string, made: number): number {
+  const table = PFAIL[providerId] ?? [];
+  if (made === 0) return table[0] ?? 1.0;
+  const p1 = table[made] ?? 1.0;
+  const p2 = table[made + 1];
+  return p2 === undefined ? p1 : (p1 + p2) / 2;
+}
+
+/**
+ * Round 3: providers to keep fresh for narrow future requests (capacity
+ * rule). For each future request with provider set S, count the future
+ * requests that can only be served from S (need) and the providers in S
+ * with no call yet (fresh). When fresh <= need, every fresh provider in S
+ * is reserved, provided the current request has a candidate outside S.
+ * The current request's own provider set comes from its candidates; each
+ * future request's set is recomputed from the manifest (its api decides the
+ * JSON-mode wire exclusion, exactly as the router would see it).
+ */
+function reservedProviders(manifestIdx: number, currentCandidates: Candidate[]): Set<string> {
+  const manifest = brief.workload?.manifest ?? [];
+  const reserved = new Set<string>();
+  if (manifestIdx < 0 || manifestIdx >= manifest.length) return reserved;
+  const curProviders = new Set(currentCandidates.map((c) => c.probe.provider.id));
+  const futureSets: Set<string>[] = [];
+  for (let i = manifestIdx + 1; i < manifest.length; i += 1) {
+    const entry = manifest[i];
+    const cands = candidatesFor(entry.requires, entry.api, entry.requires.json === true);
+    futureSets.push(new Set(cands.map((c) => c.probe.provider.id)));
+  }
+  for (const s of futureSets) {
+    const need = futureSets.filter((t) => [...t].every((p) => s.has(p))).length;
+    const fresh = [...s].filter((p) => (callsMade.get(p) ?? 0) === 0);
+    if (fresh.length > need) continue;
+    let hasOutside = false;
+    for (const cp of curProviders) if (!s.has(cp)) { hasOutside = true; break; }
+    if (!hasOutside) continue;
+    for (const p of fresh) reserved.add(p);
+  }
+  return reserved;
+}
+
+/**
+ * The next candidate to try, round 3 (risk-aware + capability reservation).
  *
  * Primary (attempt 0): among the candidates within DELTA of the best rating
- * (tighter for weight-2 requests, which count double toward quality), take
- * the one whose NEXT call to its provider is least likely to fail, by the
- * PFAIL table. Candidates under their provider's minimum budget come first:
- * the plan never leans on a budget it cannot see while a cheaper slot is
- * open. A provider that failed three calls in a row is treated as dark and
- * only revisited when nothing else can serve. Ties break by rating, then
+ * (tighter for weight-2 requests, which count double toward quality; the
+ * weight-1 slack tightens back to the round-2 value once the cumulative
+ * rating loss reaches LOSS_CAP), take the one whose next calls are least
+ * likely to fail, by the PFAIL table averaged over the next two calls for
+ * a provider already used. Candidates under their provider's minimum budget
+ * come first: the plan never leans on a budget it cannot see while a
+ * cheaper slot is open. A provider that failed three calls in a row is
+ * treated as dark and only revisited when nothing else can serve. Before
+ * any of that, a provider reserved for a narrow future request is skipped
+ * while an unreserved candidate can serve. Ties break by rating, then
  * provider id, then model id, so the choice is deterministic.
  *
  * Retry (attempt > 0): a fresh provider's first call can never fail, so a
@@ -248,11 +345,16 @@ function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic',
  * gamble another call on a used provider, again by least PFAIL within
  * DELTA_RETRY of the best.
  */
-function pickCandidate(candidates: Candidate[], tried: Set<string>, attempt: number, weight: 1 | 2): Candidate | null {
+function pickCandidate(candidates: Candidate[], tried: Set<string>, attempt: number, weight: 1 | 2, manifestIdx: number): Candidate | null {
   const fresh = candidates.filter((c) => !tried.has(candidateKey(c)));
   if (fresh.length === 0) return null;
   const alive = fresh.filter((c) => (consecutiveFailures.get(c.probe.provider.id) ?? 0) < 3);
-  const pool = alive.length > 0 ? alive : fresh;
+  let pool = alive.length > 0 ? alive : fresh;
+  const reserved = reservedProviders(manifestIdx, candidates);
+  if (reserved.size > 0) {
+    const unreserved = pool.filter((c) => !reserved.has(c.probe.provider.id));
+    if (unreserved.length > 0) pool = unreserved;
+  }
   const underCap = pool.filter((c) => (callsMade.get(c.probe.provider.id) ?? 0) < (BUDGET_MIN[c.probe.provider.id] ?? 3));
   const capped = underCap.length > 0 ? underCap : pool;
   const bestRating = Math.max(...capped.map((c) => c.rating));
@@ -262,11 +364,11 @@ function pickCandidate(candidates: Candidate[], tried: Set<string>, attempt: num
       .sort((a, b) => b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : 1) || (a.model.id < b.model.id ? -1 : 1));
     if (freshProviders.length > 0) return freshProviders[0];
   }
-  const delta = attempt > 0 ? DELTA_RETRY : weight === 2 ? DELTA_WEIGHT_2 : DELTA_WEIGHT_1;
+  const delta = attempt > 0 ? DELTA_RETRY : weight === 2 ? DELTA_WEIGHT_2 : lossSoFar >= LOSS_CAP ? DELTA_WEIGHT_1_CAPPED : DELTA_WEIGHT_1;
   const near = capped.filter((c) => c.rating >= bestRating - delta);
   const ranked = (near.length > 0 ? near : capped).sort((a, b) => {
-    const pa = (PFAIL[a.probe.provider.id] ?? [])[callsMade.get(a.probe.provider.id) ?? 0] ?? 1.0;
-    const pb = (PFAIL[b.probe.provider.id] ?? [])[callsMade.get(b.probe.provider.id) ?? 0] ?? 1.0;
+    const pa = rankKey(a.probe.provider.id, callsMade.get(a.probe.provider.id) ?? 0);
+    const pb = rankKey(b.probe.provider.id, callsMade.get(b.probe.provider.id) ?? 0);
     return pa - pb || b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : 1) || (a.model.id < b.model.id ? -1 : 1);
   });
   return ranked[0];
@@ -324,13 +426,14 @@ async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthrop
   return { status: response.status, answer, retryable: false };
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): { requires: Requirement; weight: 1 | 2 } {
+/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. `index` is the manifest row, or -1 when the request is not in the manifest. */
+function requirementsFor(body: Json): { requires: Requirement; weight: 1 | 2; index: number } {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
+  const index = entry !== undefined ? manifestIndex : -1;
   manifestIndex += 1;
-  if (entry !== undefined) return { requires: entry.requires, weight: entry.weight };
-  return { requires: requirementsFromBody(body), weight: 1 };
+  if (entry !== undefined) return { requires: entry.requires, weight: entry.weight, index };
+  return { requires: requirementsFromBody(body), weight: 1, index: -1 };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -359,12 +462,13 @@ function jsonModeOf(body: Json, clientApi: 'openai' | 'anthropic'): boolean {
  * answer, or null when no candidate could serve it.
  */
 async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ model: string; answer: ProviderAnswer } | null> {
-  const { requires, weight } = requirementsFor(body);
+  const { requires, weight, index: manifestIdx } = requirementsFor(body);
   const jsonMode = jsonModeOf(body, clientApi);
   const candidates = candidatesFor(requires, clientApi, jsonMode);
+  const bestRating = candidates.length > 0 ? Math.max(...candidates.map((c) => c.rating)) : 0;
   const tried = new Set<string>();
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-    const candidate = pickCandidate(candidates, tried, attempt, weight);
+    const candidate = pickCandidate(candidates, tried, attempt, weight, manifestIdx);
     if (candidate === null) return null;
     const key = candidateKey(candidate);
     tried.add(key);
@@ -373,6 +477,8 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ m
     const result = await callUpstream(candidate, clientApi, body, jsonMode);
     if (result.answer !== null) {
       consecutiveFailures.set(providerId, 0);
+      // Round 3 loss cap: the rating given up on this request, weighted.
+      lossSoFar += weight * (bestRating - candidate.rating);
       return { model: candidate.model.id, answer: result.answer };
     }
     consecutiveFailures.set(providerId, (consecutiveFailures.get(providerId) ?? 0) + 1);
