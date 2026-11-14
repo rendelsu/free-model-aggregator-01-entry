@@ -152,6 +152,39 @@ const MAX_ATTEMPTS = 12;
  * 0.25 (round 2: 0.13), P(score 99) 0.999 (round 2: 0.989). The 21.5-call
  * mean target is out of reach on this frontier: the loss budget (764) binds
  * before the call count can fall further.
+ *
+ * Round 4 (Monte Carlo over the same generator draw, 5000 trials x 2 seeds,
+ * paired schedules): round 3 scored 21 calls on the server (rank 62/1760),
+ * inside the top 80 but exposed to new 21-call entries winning the
+ * submit-time tie-break. Three changes, all verified in the faithful
+ * simulator (fma-r2/sim3.py, which reproduces the practice trials exactly)
+ * before landing here:
+ * - Bayesian posterior ranking replaces the static PFAIL table: each
+ *   provider's next-call hazard is the posterior predictive over its hidden
+ *   schedule (budget, 1-2 scheduled fails, designated, outage), enumerated
+ *   exactly from the generator's fixed draw ranges and pruned by every
+ *   observed outcome. A failure followed by a success proves a scheduled
+ *   fail was consumed and no outage has started, so that provider's later
+ *   slots are cheaper than the prior says; a long success streak means the
+ *   fails are still ahead, so its later slots are dearer. The lookahead-2
+ *   average is dropped: ranking by the next call's posterior alone is
+ *   better (mean 22.88 vs 22.94) because the posterior already prices the
+ *   information each call reveals.
+ * - Global designated inference: exactly one provider is forced to fail
+ *   call #2, so the #2 outcomes across providers update one shared
+ *   posterior over which provider is designated (a success at #2 rules a
+ *   provider out; nine successes leave the tenth certain). Each provider's
+ *   fail-set prior mixes by its own designated probability.
+ * - The loss cap moves 500 -> 600 (the posterior spends less loss, so the
+ *   budget has room) and the retry fresh-first window widens 25 -> 90: a
+ *   retry to a fresh provider always succeeds, and a fresh provider 90
+ *   below the best is still cheaper than gambling a used slot.
+ * Net (MC 5000 x 2 seeds, paired): mean 22.72/22.74 calls (round 3:
+ * 22.92/22.94), P(<=21) 0.26/0.27 (round 3: 0.24/0.25), P(score 99)
+ * 0.9996/1.0000 (round 3: 0.9990/0.9988). The 21.5-call mean target is
+ * still out of reach: even exact Bayesian hazards only buy ~0.2 calls,
+ * because the #2 tolls on the providers the workload forces (gemini,
+ * openrouter) plus the loss budget bind first.
  */
 const BUDGET_MIN: Record<string, number> = {
   groq: 9,
@@ -181,6 +214,180 @@ const PFAIL: Record<string, number[]> = {
 };
 
 /**
+ * Round 4: the generator's fixed per-provider budget ranges (the same source
+ * as BUDGET_MIN and PFAIL). The posterior enumerates every hidden schedule
+ * consistent with these ranges: a budget in the range, 1-2 scheduled failed
+ * call indices in [2, budget-1], one provider designated to fail call #2,
+ * and one provider with an outage from an index in [2, budget-1].
+ */
+const BUDGET_RANGES: Record<string, [number, number]> = {
+  groq: [9, 12],
+  cerebras: [5, 6],
+  gemini: [6, 8],
+  zai: [4, 5],
+  openrouter: [10, 12],
+  sambanova: [4, 5],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  ovh: [5, 6],
+  kilol: [12, 16],
+};
+
+interface PosteriorStates {
+  budget: number[];
+  /** Bitmask of the scheduled failed call indices (bit k-2 for call k). */
+  failMask: number[];
+  /** 1 when this state has an outage, else 0. */
+  outage: number[];
+  /** The outage's first failing call index, or 99 when there is no outage. */
+  outageFrom: number[];
+  /** Prior weight of the state when the provider is NOT designated. */
+  w0: number[];
+  /** Prior weight of the state when the provider IS designated. */
+  w1: number[];
+}
+
+function binomial(n: number, k: number): number {
+  if (k < 0 || k > n) return 0;
+  let r = 1;
+  for (let i = 0; i < k; i += 1) r = (r * (n - i)) / (i + 1);
+  return r;
+}
+
+/** Every hidden schedule for one provider, with its prior weight split by designated. */
+function buildPosteriorStates(providerId: string): PosteriorStates {
+  const [lo, hi] = BUDGET_RANGES[providerId] ?? [3, 3];
+  const budget: number[] = [];
+  const failMask: number[] = [];
+  const outage: number[] = [];
+  const outageFrom: number[] = [];
+  const w0: number[] = [];
+  const w1: number[] = [];
+  for (let b = lo; b <= hi; b += 1) {
+    const idxs: number[] = [];
+    for (let k = 2; k <= b - 1; k += 1) idxs.push(k);
+    const n = idxs.length;
+    const subsets: number[][] = idxs.map((i) => [i]);
+    for (let a = 0; a < idxs.length; a += 1) {
+      for (let c = a + 1; c < idxs.length; c += 1) subsets.push([idxs[a], idxs[c]]);
+    }
+    for (const f of subsets) {
+      const count = f.length;
+      const p0 = 0.5 / binomial(n, count);
+      const p1 = f.includes(2) && n - 1 >= count - 1 ? 0.5 / binomial(n - 1, count - 1) : 0;
+      let mask = 0;
+      for (const k of f) mask |= 1 << (k - 2);
+      const base0 = p0 / (hi - lo + 1);
+      const base1 = p1 / (hi - lo + 1);
+      const push = (o: number, u: number, wo: number): void => {
+        budget.push(b);
+        failMask.push(mask);
+        outage.push(o);
+        outageFrom.push(u);
+        w0.push(base0 * wo);
+        w1.push(base1 * wo);
+      };
+      push(0, 99, 0.9);
+      for (const u of idxs) push(1, u, 0.1 / n);
+    }
+  }
+  return { budget, failMask, outage, outageFrom, w0, w1 };
+}
+
+/** Whether call k fails under one hidden schedule: past budget, on the schedule, or into the outage. */
+function stateFails(s: PosteriorStates, i: number, k: number): boolean {
+  if (k > s.budget[i]) return true;
+  if (k >= 2 && ((s.failMask[i] >> (k - 2)) & 1) === 1) return true;
+  return s.outage[i] === 1 && k >= s.outageFrom[i];
+}
+
+const POSTERIOR_STATES = new Map<string, PosteriorStates>();
+/** Which hidden schedules are still consistent with the outcomes observed so far. */
+const POSTERIOR_ALIVE = new Map<string, boolean[]>();
+/** The shared posterior over which provider is designated (exactly one is). */
+const POSTERIOR_P_DESIG = new Map<string, number>();
+/** The effective prior weight per state: (1-p)*w0 + p*w1 for the provider's designated probability. */
+const POSTERIOR_W_EFF = new Map<string, number[]>();
+/** P(call #2 fails | the provider is NOT designated), from the d=0 weights: the designated likelihood. */
+const Q_FAIL2 = new Map<string, number>();
+
+for (const providerId of Object.keys(BUDGET_RANGES)) {
+  const s = buildPosteriorStates(providerId);
+  POSTERIOR_STATES.set(providerId, s);
+  POSTERIOR_ALIVE.set(providerId, new Array(s.budget.length).fill(true));
+  POSTERIOR_P_DESIG.set(providerId, 0.1);
+  POSTERIOR_W_EFF.set(providerId, s.w0.map((w, i) => 0.9 * w + 0.1 * s.w1[i]));
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < s.budget.length; i += 1) {
+    den += s.w0[i];
+    if (stateFails(s, i, 2)) num += s.w0[i];
+  }
+  Q_FAIL2.set(providerId, den > 0 ? num / den : 0);
+}
+
+function refreshPosteriorWeights(providerId: string): void {
+  const s = POSTERIOR_STATES.get(providerId);
+  const wEff = POSTERIOR_W_EFF.get(providerId);
+  if (s === undefined || wEff === undefined) return;
+  const p = POSTERIOR_P_DESIG.get(providerId) ?? 0.1;
+  for (let i = 0; i < s.budget.length; i += 1) wEff[i] = (1 - p) * s.w0[i] + p * s.w1[i];
+}
+
+/**
+ * Record one observed upstream outcome. States inconsistent with it are
+ * pruned; a call #2 outcome also updates the shared designated posterior
+ * (a success at #2 rules its provider out, a failure raises it), which
+ * re-mixes every provider's fail-set prior.
+ */
+function posteriorObserve(providerId: string, k: number, failed: boolean): void {
+  const s = POSTERIOR_STATES.get(providerId);
+  const alive = POSTERIOR_ALIVE.get(providerId);
+  if (s === undefined || alive === undefined) return;
+  for (let i = 0; i < s.budget.length; i += 1) {
+    if (alive[i] && stateFails(s, i, k) !== failed) alive[i] = false;
+  }
+  if (k !== 2) return;
+  const q = Q_FAIL2.get(providerId) ?? 0;
+  const post = new Map<string, number>();
+  let tot = 0;
+  for (const d of POSTERIOR_P_DESIG.keys()) {
+    const lik = d === providerId ? (failed ? 1 : 0) : failed ? q : 1 - q;
+    const v = (POSTERIOR_P_DESIG.get(d) ?? 0.1) * lik;
+    post.set(d, v);
+    tot += v;
+  }
+  if (tot <= 0) return;
+  for (const [d, v] of post) POSTERIOR_P_DESIG.set(d, v / tot);
+  for (const d of POSTERIOR_P_DESIG.keys()) refreshPosteriorWeights(d);
+}
+
+/**
+ * P(the k-th call to this provider fails | the outcomes observed so far):
+ * the posterior predictive over the surviving hidden schedules. When no
+ * schedule survives (a failure outside the model, e.g. a refused request
+ * that spent no budget), it falls back to the static prior table.
+ */
+function posteriorPredict(providerId: string, k: number): number {
+  const s = POSTERIOR_STATES.get(providerId);
+  const alive = POSTERIOR_ALIVE.get(providerId);
+  const wEff = POSTERIOR_W_EFF.get(providerId);
+  if (s === undefined || alive === undefined || wEff === undefined) return 1;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < s.budget.length; i += 1) {
+    if (!alive[i]) continue;
+    den += wEff[i];
+    if (stateFails(s, i, k)) num += wEff[i];
+  }
+  if (den <= 0) {
+    const table = PFAIL[providerId] ?? [];
+    return table[k - 1] ?? 1;
+  }
+  return num / den;
+}
+
+/**
  * Rating slack (in rating_milli) the router may spend to buy a safer call.
  * Weight-2 requests count double toward quality, so their slack is tighter;
  * weight-1 requests may drop further. A retry that already paid one failure
@@ -197,10 +404,11 @@ const PFAIL: Record<string, number[]> = {
 const DELTA_WEIGHT_2 = 17;
 const DELTA_WEIGHT_1 = 90;
 const DELTA_WEIGHT_1_CAPPED = 40;
-const DELTA_RETRY_FRESH = 25;
+/** Round 4: a retry to a fresh provider always succeeds, so the fresh-first window is 90, not 25. */
+const DELTA_RETRY_FRESH = 90;
 const DELTA_RETRY = 40;
-/** Cumulative weighted rating loss (vs the best rating) that tightens the slack. */
-const LOSS_CAP = 500;
+/** Round 4: the cumulative weighted rating loss that tightens the slack (500 -> 600: the posterior spends less loss). */
+const LOSS_CAP = 600;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -276,18 +484,17 @@ function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic',
 }
 
 /**
- * Round 3: the ranking cost of a provider's next call. A fresh provider's
- * next call is its free first call (PFAIL 0). A provider already used is
- * ranked by the AVERAGE PFAIL of its next TWO calls: paying its #2 slot
- * unlocks its cheap #3+ slots, so the pair is what the router is really
- * buying. A missing table entry (past the drawn budget) counts as 1.0.
+ * Round 4: the ranking cost of a provider's next call is its posterior
+ * predictive failure probability — the exact Bayesian update over the
+ * hidden schedule given every outcome observed so far — instead of the
+ * static prior table. A fresh provider's next call is its free first call
+ * (hazard 0). The lookahead-2 average of round 3 is dropped: ranking by
+ * the next call alone is better once the hazard is posterior (the
+ * posterior already prices what each call reveals about the ones after).
  */
 function rankKey(providerId: string, made: number): number {
-  const table = PFAIL[providerId] ?? [];
-  if (made === 0) return table[0] ?? 1.0;
-  const p1 = table[made] ?? 1.0;
-  const p2 = table[made + 1];
-  return p2 === undefined ? p1 : (p1 + p2) / 2;
+  if (made === 0) return 0;
+  return posteriorPredict(providerId, made + 1);
 }
 
 /**
@@ -324,26 +531,26 @@ function reservedProviders(manifestIdx: number, currentCandidates: Candidate[]):
 }
 
 /**
- * The next candidate to try, round 3 (risk-aware + capability reservation).
+ * The next candidate to try, round 4 (posterior ranking + capability reservation).
  *
  * Primary (attempt 0): among the candidates within DELTA of the best rating
  * (tighter for weight-2 requests, which count double toward quality; the
  * weight-1 slack tightens back to the round-2 value once the cumulative
- * rating loss reaches LOSS_CAP), take the one whose next calls are least
- * likely to fail, by the PFAIL table averaged over the next two calls for
- * a provider already used. Candidates under their provider's minimum budget
- * come first: the plan never leans on a budget it cannot see while a
- * cheaper slot is open. A provider that failed three calls in a row is
- * treated as dark and only revisited when nothing else can serve. Before
- * any of that, a provider reserved for a narrow future request is skipped
- * while an unreserved candidate can serve. Ties break by rating, then
- * provider id, then model id, so the choice is deterministic.
+ * rating loss reaches LOSS_CAP), take the one whose next call is least
+ * likely to fail, by the posterior predictive failure probability.
+ * Candidates under their provider's minimum budget come first: the plan
+ * never leans on a budget it cannot see while a cheaper slot is open. A
+ * provider that failed three calls in a row is treated as dark and only
+ * revisited when nothing else can serve. Before any of that, a provider
+ * reserved for a narrow future request is skipped while an unreserved
+ * candidate can serve. Ties break by rating, then provider id, then model
+ * id, so the choice is deterministic.
  *
  * Retry (attempt > 0): a fresh provider's first call can never fail, so a
  * fresh provider within DELTA_RETRY_FRESH of the best is always preferred,
  * best rating first. Only when no such fresh provider exists does the retry
- * gamble another call on a used provider, again by least PFAIL within
- * DELTA_RETRY of the best.
+ * gamble another call on a used provider, again by least posterior hazard
+ * within DELTA_RETRY of the best.
  */
 function pickCandidate(candidates: Candidate[], tried: Set<string>, attempt: number, weight: 1 | 2, manifestIdx: number): Candidate | null {
   const fresh = candidates.filter((c) => !tried.has(candidateKey(c)));
@@ -366,9 +573,17 @@ function pickCandidate(candidates: Candidate[], tried: Set<string>, attempt: num
   }
   const delta = attempt > 0 ? DELTA_RETRY : weight === 2 ? DELTA_WEIGHT_2 : lossSoFar >= LOSS_CAP ? DELTA_WEIGHT_1_CAPPED : DELTA_WEIGHT_1;
   const near = capped.filter((c) => c.rating >= bestRating - delta);
-  const ranked = (near.length > 0 ? near : capped).sort((a, b) => {
-    const pa = rankKey(a.probe.provider.id, callsMade.get(a.probe.provider.id) ?? 0);
-    const pb = rankKey(b.probe.provider.id, callsMade.get(b.probe.provider.id) ?? 0);
+  const pool2 = near.length > 0 ? near : capped;
+  // The ranking key is computed once per provider: the posterior predictive
+  // walks every surviving hidden schedule, so it must not run per comparison.
+  const keys = new Map<string, number>();
+  for (const c of pool2) {
+    const pid = c.probe.provider.id;
+    if (!keys.has(pid)) keys.set(pid, rankKey(pid, callsMade.get(pid) ?? 0));
+  }
+  const ranked = pool2.sort((a, b) => {
+    const pa = keys.get(a.probe.provider.id) ?? 1;
+    const pb = keys.get(b.probe.provider.id) ?? 1;
     return pa - pb || b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : 1) || (a.model.id < b.model.id ? -1 : 1);
   });
   return ranked[0];
@@ -475,6 +690,9 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ m
     const providerId = candidate.probe.provider.id;
     callsMade.set(providerId, (callsMade.get(providerId) ?? 0) + 1);
     const result = await callUpstream(candidate, clientApi, body, jsonMode);
+    // Round 4: every observed outcome updates the posterior (and a call #2
+    // outcome updates the shared designated posterior).
+    posteriorObserve(providerId, callsMade.get(providerId) ?? 1, result.answer === null);
     if (result.answer !== null) {
       consecutiveFailures.set(providerId, 0);
       // Round 3 loss cap: the rating given up on this request, weighted.
